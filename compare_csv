@@ -1,0 +1,21 @@
+import pandas as pd
+
+# Load the CSV files
+df1 = pd.read_csv('file1.csv')
+df2 = pd.read_csv('file2.csv')
+
+# Ensure trade Id is treated consistently
+df1['trade Id'] = df1['trade Id'].astype(str).str.strip()
+df2['trade Id'] = df2['trade Id'].astype(str).str.strip()
+
+# Get sets of trade Ids
+trade_ids_1 = set(df1['trade Id'])
+trade_ids_2 = set(df2['trade Id'])
+
+# Calculate differences
+only_in_file1 = trade_ids_1 - trade_ids_2
+only_in_file2 = trade_ids_2 - trade_ids_1
+
+# Output the counts
+print("Records in file1 not in file2:", len(only_in_file1))
+print("Records in file2 not in file1:", len(only_in_file2))
