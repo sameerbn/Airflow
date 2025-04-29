@@ -1,0 +1,206 @@
+Perfect — you are asking for the best architecture!
+Let’s now refactor into a DAG Factory pattern — meaning:
+
+One Python file dynamically generates multiple DAGs.
+
+Each config = one DAG, with its own independent schedule, email, files to check, etc.
+
+Fully scalable — just add to Airflow Variable, no code changes needed!
+
+
+
+---
+
+Final Code: DAG Factory Pattern
+
+from airflow import DAG
+from airflow.operators.python import PythonOperator
+from airflow.operators.email import EmailOperator
+from airflow.sensors.base import BaseSensorOperator
+from airflow.utils.dates import days_ago
+from airflow.utils.trigger_rule import TriggerRule
+from airflow.models import Variable
+from datetime import timedelta
+import json
+import re
+
+# Azure SDK imports
+from azure.identity import DefaultAzureCredential
+from azure.storage.filedatalake import DataLakeServiceClient
+
+# --------- Utility Functions ----------
+
+def files_exist_in_adls(paths):
+    credential = DefaultAzureCredential()
+    service_client = DataLakeServiceClient(
+        account_url=f"https://{extract_account_name(paths[0])}.dfs.core.windows.net",
+        credential=credential
+    )
+    for path in paths:
+        try:
+            account, container, file_path = parse_adls_path(path)
+            file_system_client = service_client.get_file_system_client(container)
+            file_client = file_system_client.get_file_client(file_path)
+            if not file_client.exists():
+                return False
+        except Exception:
+            return False
+    return True
+
+def parse_adls_path(path):
+    match = re.match(r'adl://([^/]+)/([^/]+)/(.+)', path)
+    if not match:
+        raise ValueError("Invalid ADLS path format.")
+    return match.group(1), match.group(2), match.group(3)
+
+def extract_account_name(adl_url):
+    return adl_url.split("//")[1].split(".")[0]
+
+# --------- Custom Sensor ----------
+
+class AzureFileSensor(BaseSensorOperator):
+    def __init__(self, file_paths, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.file_paths = file_paths
+
+    def poke(self, context):
+        return files_exist_in_adls(self.file_paths)
+
+# --------- Factory Method to Create DAGs ----------
+
+def create_file_check_dag(config):
+    dag_id = f"file_check_{config['name']}"
+
+    default_args = {
+        'owner': 'airflow',
+        'start_date': days_ago(1),
+        'retries': 3,
+        'retry_delay': timedelta(minutes=10),
+    }
+
+    dag = DAG(
+        dag_id=dag_id,
+        default_args=default_args,
+        description=f"File check DAG for {config['name']}",
+        schedule_interval=config['schedule'],
+        catchup=False,
+        tags=['file_check', 'adls'],
+    )
+
+    with dag:
+        # 1. Sensor Task
+        check_files = AzureFileSensor(
+            task_id="check_files",
+            file_paths=config["file_paths"],
+            poke_interval=3600,
+            timeout=60 * 60 * 24,
+            mode="reschedule",
+        )
+
+        # 2. Prepare Email
+        def prepare_email(**kwargs):
+            ti = kwargs['ti']
+            sensor_status = ti.xcom_pull(task_ids='check_files', key='return_value')
+            retries = 3  # static for now
+
+            status = "Success" if sensor_status else "Failure"
+            subject = f"File Check {status} for {config['name']}"
+            body = f"""
+            Hello,<br><br>
+            File check for <b>{config['name']}</b> has completed.<br>
+            <b>Status:</b> {status}<br>
+            <b>Retries:</b> {retries}<br>
+            <b>Paths:</b> {config['file_paths']}<br><br>
+            Regards,<br>Airflow
+            """
+            return {"subject": subject, "body": body, "to": config['notification_email']}
+
+        prepare_email_task = PythonOperator(
+            task_id="prepare_email",
+            python_callable=prepare_email,
+            provide_context=True,
+        )
+
+        # 3. Send Email
+        send_email_task = EmailOperator(
+            task_id="send_email",
+            to="{{ task_instance.xcom_pull(task_ids='prepare_email')['to'] }}",
+            subject="{{ task_instance.xcom_pull(task_ids='prepare_email')['subject'] }}",
+            html_content="{{ task_instance.xcom_pull(task_ids='prepare_email')['body'] }}",
+            trigger_rule=TriggerRule.ALL_DONE
+        )
+
+        check_files >> prepare_email_task >> send_email_task
+
+    return dag
+
+# --------- Read Configs and Generate DAGs ----------
+
+configs = json.loads(Variable.get("azure_file_check_configs"))
+
+for config in configs:
+    globals()[f"file_check_{config['name']}"] = create_file_check_dag(config)
+
+
+---
+
+Summary
+
+
+---
+
+How this looks in Airflow UI:
+
+DAGs like:
+
+file_check_daily_check_1
+
+file_check_weekly_check
+
+etc.
+
+
+
+Each with its own schedule and file check logic!
+
+
+---
+
+Example airflow Variable ("azure_file_check_configs")
+
+[
+  {
+    "name": "daily_check_1",
+    "schedule": "0 9 * * 1-5",
+    "file_paths": [
+      "adl://<account>.dfs.core.windows.net/container/path/file1.csv",
+      "adl://<account>.dfs.core.windows.net/container/path/file2.csv"
+    ],
+    "notification_email": "team1@example.com"
+  },
+  {
+    "name": "weekly_check",
+    "schedule": "30 14 * * 0",
+    "file_paths": [
+      "adl://<account>.dfs.core.windows.net/container/data/fileA.csv",
+      "adl://<account>.dfs.core.windows.net/container/data/fileB.csv"
+    ],
+    "notification_email": "team2@example.com"
+  }
+]
+
+
+---
+
+Would you like me also to show:
+
+A super optimized version where no XComs at all using only task parameters?
+
+Add SLA Miss or Failure callback email if sensor fails?
+
+
+(very useful for critical monitoring DAGs)
+
+Would you want that too?
+
+
