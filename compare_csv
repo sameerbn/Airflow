@@ -1,21 +1,39 @@
+Here's a Python script to compare two columns within the same CSV file, and count how many values are:
+
+In Column A but not in Column B
+
+In Column B but not in Column A
+
+
 import pandas as pd
 
-# Load the CSV files
-df1 = pd.read_csv('file1.csv')
-df2 = pd.read_csv('file2.csv')
+# Replace with your actual CSV file
+file = 'your_file.csv'
 
-# Ensure trade Id is treated consistently
-df1['trade Id'] = df1['trade Id'].astype(str).str.strip()
-df2['trade Id'] = df2['trade Id'].astype(str).str.strip()
+# Column names to compare (case-sensitive)
+col1 = 'ColumnA'
+col2 = 'ColumnB'
 
-# Get sets of trade Ids
-trade_ids_1 = set(df1['trade Id'])
-trade_ids_2 = set(df2['trade Id'])
+# Read the CSV (you can specify encoding if needed)
+df = pd.read_csv(file, encoding='utf-8')
 
-# Calculate differences
-only_in_file1 = trade_ids_1 - trade_ids_2
-only_in_file2 = trade_ids_2 - trade_ids_1
+# Normalize values (strip spaces, convert to string)
+df[col1] = df[col1].astype(str).str.strip()
+df[col2] = df[col2].astype(str).str.strip()
 
-# Output the counts
-print("Records in file1 not in file2:", len(only_in_file1))
-print("Records in file2 not in file1:", len(only_in_file2))
+# Get unique values from each column
+set1 = set(df[col1])
+set2 = set(df[col2])
+
+# Compare
+only_in_col1 = set1 - set2
+only_in_col2 = set2 - set1
+
+print(f"Records in {col1} but not in {col2}: {len(only_in_col1)}")
+print(f"Records in {col2} but not in {col1}: {len(only_in_col2)}")
+
+# Optional: save mismatches to CSV
+pd.DataFrame({col1: list(only_in_col1)}).to_csv('only_in_col1.csv', index=False)
+pd.DataFrame({col2: list(only_in_col2)}).to_csv('only_in_col2.csv', index=False)
+
+Replace 'your_file.csv', 'ColumnA', and 'ColumnB' with your actual file and column names.
