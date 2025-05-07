@@ -1,55 +1,44 @@
-from airflow import DAG
-from airflow.operators.python import PythonOperator
-from airflow.models import Variable
-from datetime import datetime, timedelta
-from adlfs import AzureBlobFileSystem
-import json
-
-MAX_RETRIES = 10
-AZURE_ACCOUNT_NAME = "your_account"
-AZURE_CONTAINER_NAME = "your-container"
-
-def get_retry_key(name, path):
-    return f"retry_count::{name}::{path}"
-
 def check_missing_files(**kwargs):
-    conf = kwargs["dag_run"].conf
+    from azure.identity import ClientSecretCredential
+    from adlfs import AzureBlobFileSystem
+
+    ti = kwargs["ti"]
+    conf = kwargs["dag_run"].conf or {}
     failed_checks = conf.get("failed_checks", [])
-    still_missing = []
+    retry_counts = ti.xcom_pull(key="retry_counts", task_ids="recheck_files") or {}
 
-    fs = AzureBlobFileSystem(account_name=AZURE_ACCOUNT_NAME, anon=False)
-
-    for item in failed_checks:
-        name = item["name"]
-        path = item["path"]
-        retry_key = get_retry_key(name, path)
-        retry_count = int(Variable.get(retry_key, default_var=0))
-
-        if retry_count >= MAX_RETRIES:
-            continue  # skip this one, maxed out
-
-        if not fs.exists(f"{AZURE_CONTAINER_NAME}/{path}"):
-            still_missing.append({"name": name, "path": path})
-            Variable.set(retry_key, retry_count + 1)
-        else:
-            Variable.delete(retry_key)  # success, remove retry counter
-
-    if not still_missing:
-        kwargs["ti"].xcom_push(key="status", value="complete")
-    else:
-        kwargs["ti"].xcom_push(key="status", value="incomplete")
-
-with DAG(
-    dag_id="file_retry_dag",
-    start_date=datetime(2024, 1, 1),
-    schedule_interval=None,  # triggered by main DAG
-    catchup=False,
-    max_active_runs=1,
-    default_args={"retries": 0, "retry_delay": timedelta(minutes=5)},
-) as dag:
-
-    check_files = PythonOperator(
-        task_id="recheck_files",
-        python_callable=check_missing_files,
-        provide_context=True
+    creds = Variable.get("adls_spn_credentials", deserialize_json=True)
+    credential = ClientSecretCredential(
+        tenant_id=creds["tenant_id"],
+        client_id=creds["client_id"],
+        client_secret=creds["client_secret"]
     )
+    fs = AzureBlobFileSystem(account_name=creds["account_name"], credential=credential)
+
+    still_missing = []
+    updated_counts = {}
+
+    for check in failed_checks:
+        name = check["name"]
+        for label in ["file_path_lake", "file_path_daas"]:
+            path = check.get(label)
+            if not path:
+                continue
+            key = f"{name}::{label}::{path}"
+            retries = retry_counts.get(key, 0)
+
+            if retries >= MAX_RETRIES:
+                continue
+
+            full_path = f"{creds['container_name']}/{path}"
+            if not fs.exists(full_path):
+                still_missing.append({"name": name, "label": label, "path": path})
+                updated_counts[key] = retries + 1
+            else:
+                updated_counts[key] = 0  # reset on success
+
+    ti.xcom_push(key="retry_counts", value=updated_counts)
+    ti.xcom_push(key="still_missing", value=still_missing)
+
+    if still_missing:
+        raise Exception("Files still missing.")
