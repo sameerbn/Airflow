@@ -1,0 +1,54 @@
+from airflow import DAG
+from airflow.operators.python import PythonOperator
+from airflow.operators.trigger_dagrun import TriggerDagRunOperator
+from airflow.models import Variable
+from datetime import datetime
+import pendulum
+from adlfs import AzureBlobFileSystem
+
+def check_and_trigger(**kwargs):
+    config = Variable.get("file_check_config", deserialize_json=True)
+    now = pendulum.now()
+    today = now.format('dddd')
+    current_time = now.format('HH:mm')
+
+    fs = AzureBlobFileSystem(account_name="your_account", anon=False)
+
+    failed_checks = []
+    for check in config["checks"]:
+        if today in check["check_days"] and current_time == check["check_time"]:
+            for path in check["file_paths"]:
+                if not fs.exists(f"your-container/{path}"):
+                    failed_checks.append({
+                        "name": check["name"],
+                        "path": path
+                    })
+
+    if failed_checks:
+        kwargs["ti"].xcom_push(key="failed_checks", value=failed_checks)
+        return True  # trigger downstream TriggerDagRunOperator
+    return False
+
+with DAG(
+    dag_id="main_file_check_dag",
+    start_date=datetime(2024, 1, 1),
+    schedule_interval="@hourly",
+    catchup=False
+) as dag:
+
+    check_files = PythonOperator(
+        task_id="check_files",
+        python_callable=check_and_trigger,
+        provide_context=True
+    )
+
+    trigger_retry = TriggerDagRunOperator(
+        task_id="trigger_retry_dag",
+        trigger_dag_id="file_retry_dag",
+        execution_date="{{ ts }}",
+        wait_for_completion=False,
+        reset_dag_run=True,
+        conf={"source_dag": "main_file_check_dag"}
+    )
+
+    check_files >> trigger_retry
