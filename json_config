@@ -1,0 +1,28 @@
+{
+  "files": [
+    {
+      "path_1": "azure://container1/folder1/data_{{ ds_nodash }}.csv",
+      "path_2": "azure://container1/folder1/metadata_{{ ds_nodash }}.json",
+      "schedule": {
+        "day": "monday",
+        "time": "09:00"
+      }
+    },
+    {
+      "path_1": "azure://container2/folder2/report_{{ ds_nodash }}.json",
+      "path_2": "azure://container2/folder2/summary_{{ ds_nodash }}.csv",
+      "schedule": {
+        "day": "monday",
+        "time": "09:00"
+      }
+    },
+    {
+      "path_1": "azure://container3/folder3/metrics_{{ ds_nodash }}.parquet",
+      "path_2": "azure://container3/folder3/logs_{{ ds_nodash }}.log",
+      "schedule": {
+        "day": "tuesday",
+        "time": "14:30"
+      }
+    }
+  ]
+}
