@@ -1,66 +1,73 @@
 from airflow import DAG
 from airflow.operators.python import PythonOperator
-from airflow.operators.trigger_dagrun import TriggerDagRunOperator
+from airflow.operators.dummy_operator import DummyOperator
 from airflow.models import Variable
+from airflow.utils.dates import days_ago
+from airflow.utils.email import send_email
 from datetime import datetime
-import pendulum
 from adlfs import AzureBlobFileSystem
-from azure.identity import ClientSecretCredential
+import pendulum
+import json
 
-def check_and_trigger(**kwargs):
-    config = Variable.get("file_check_config", deserialize_json=True)
-    now = pendulum.now()
-    today = now.format('dddd')  # e.g. 'Monday'
-    current_time = now.format('HH:mm')  # e.g. '10:00'
+from CheckAzureFileOperator import CheckAzureFileOperator
 
-    # Load SPN credentials
-    creds = Variable.get("adls_spn_credentials", deserialize_json=True)
-    credential = ClientSecretCredential(
-        tenant_id=creds["tenant_id"],
-        client_id=creds["client_id"],
-        client_secret=creds["client_secret"]
+RETRY_VAR_KEY = "azure_file_retry_tracker"
+
+def check_and_track_missing_files(**context):
+    config = Variable.get("azure_file_check_config", deserialize_json=True)
+    now = pendulum.now("UTC")
+    current_day = now.format("dddd").lower()
+    current_time = now.format("HH:mm")
+
+    missing_files = []
+    retry_data = Variable.get(RETRY_VAR_KEY, default_var='{}', deserialize_json=True)
+
+    for entry in config["files"]:
+        paths = [entry["path_1"], entry["path_2"]]
+        schedule = entry["schedule"]
+        scheduled_day = schedule["day"].lower()
+        scheduled_time = schedule["time"]
+
+        if current_day == scheduled_day and current_time == scheduled_time:
+            for path in paths:
+                missing_files.append({"path": path})
+                retry_data.setdefault(path, 0)
+
+    Variable.set(RETRY_VAR_KEY, json.dumps(retry_data))
+    context['ti'].xcom_push(key='missing_files', value=missing_files)
+
+def run_file_check_task(file_info, **context):
+    file_path = file_info['path']
+    task = CheckAzureFileOperator(
+        task_id=f'check_file_{file_path}',
+        file_path=file_path,
     )
-    fs = AzureBlobFileSystem(account_name=creds["account_name"], credential=credential)
-
-    failed_checks = []
-
-    # Iterate over each check in the config
-    for check in config["checks"]:
-        if today in check["check_days"] and current_time == check["check_time"]:
-            for label in ["file_path_lake", "file_path_daas"]:
-                path = check.get(label)
-                if path and not fs.exists(f"{creds['container_name']}/{path}"):
-                    failed_checks.append({
-                        "name": check["name"],
-                        "label": label,
-                        "path": path
-                    })
-
-    if failed_checks:
-        kwargs["ti"].xcom_push(key="failed_checks", value=failed_checks)
-        return 'retry_check'
-    return 'check_success'
+    task.execute(context)
 
 with DAG(
-    dag_id="main_file_check_dag",
+    dag_id='azure_file_check_dag',
     start_date=datetime(2024, 1, 1),
-    schedule_interval="@hourly",
-    catchup=False
+    schedule_interval='*/30 * * * *',  # runs every 30 minutes
+    catchup=False,
+    tags=['azure', 'datalake', 'file-check']
 ) as dag:
 
-    check_files = PythonOperator(
-        task_id="check_files",
-        python_callable=check_and_trigger,
+    detect_missing = PythonOperator(
+        task_id='check_and_track_missing_files',
+        python_callable=check_and_track_missing_files,
         provide_context=True
     )
 
-    trigger_retry = TriggerDagRunOperator(
-        task_id="trigger_retry_dag",
-        trigger_dag_id="file_retry_dag",
-        execution_date="{{ ts }}",
-        wait_for_completion=False,
-        reset_dag_run=True,
-        conf={"source_dag": "main_file_check_dag"}
+    def generate_file_check_tasks(**context):
+        missing = context['ti'].xcom_pull(task_ids='check_and_track_missing_files')
+        if missing:
+            for i, file_info in enumerate(missing):
+                run_file_check_task(file_info, **context)
+
+    check_files = PythonOperator(
+        task_id='generate_file_check_tasks',
+        python_callable=generate_file_check_tasks,
+        provide_context=True
     )
 
-    check_files >> trigger_retry
+    detect_missing >> check_files
