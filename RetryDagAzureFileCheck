@@ -1,44 +1,92 @@
-def check_missing_files(**kwargs):
-    from azure.identity import ClientSecretCredential
-    from adlfs import AzureBlobFileSystem
+from airflow import DAG
+from airflow.operators.python import PythonOperator
+from airflow.models import DagRun, TaskInstance, Variable
+from airflow.exceptions import AirflowSkipException
+from airflow.utils.email import send_email
+from datetime import timedelta
+from adlfs import AzureBlobFileSystem
+import pendulum
+import json
 
-    ti = kwargs["ti"]
-    conf = kwargs["dag_run"].conf or {}
-    failed_checks = conf.get("failed_checks", [])
-    retry_counts = ti.xcom_pull(key="retry_counts", task_ids="recheck_files") or {}
+RETRY_VAR_KEY = "azure_file_retry_tracker"
 
-    creds = Variable.get("adls_spn_credentials", deserialize_json=True)
-    credential = ClientSecretCredential(
-        tenant_id=creds["tenant_id"],
-        client_id=creds["client_id"],
-        client_secret=creds["client_secret"]
+default_args = {
+    'retries': 0,
+}
+
+def get_missing_files_from_xcom(**context):
+    dag_runs = DagRun.find(dag_id='azure_file_check_dag')
+    if not dag_runs:
+        return []
+
+    latest_run = sorted(dag_runs, key=lambda r: r.execution_date, reverse=True)[0]
+    ti = TaskInstance(task=context['task'], execution_date=latest_run.execution_date)
+    ti.task_id = 'check_and_track_missing_files'
+    return ti.xcom_pull(
+        dag_id='azure_file_check_dag',
+        task_ids='check_and_track_missing_files',
+        key='missing_files'
+    ) or []
+
+def retry_file_check_with_limit(file_info, **context):
+    path = file_info['path']
+    retry_data = Variable.get(RETRY_VAR_KEY, default_var='{}', deserialize_json=True)
+    retry_count = retry_data.get(path, 0)
+
+    if retry_count >= 10:
+        send_email(
+            to="alerts@yourcompany.com",
+            subject=f"[Airflow Alert] File missing after 10 retries: {path}",
+            html_content=f"""
+            <p>The file <strong>{path}</strong> has not been found in Azure Data Lake after 10 retry attempts.</p>
+            <p>This entry has now been removed from the retry tracker.</p>
+            """
+        )
+        retry_data.pop(path, None)
+        Variable.set(RETRY_VAR_KEY, json.dumps(retry_data))
+        raise AirflowSkipException(f"Max retries exceeded for {path}")
+
+    abfs = AzureBlobFileSystem(account_name='your_account', account_key='your_key')
+    azure_path = path.replace("azure://", "")
+    if abfs.exists(azure_path):
+        print(f"File now available: {path}")
+        retry_data.pop(path, None)
+    else:
+        retry_data[path] = retry_count + 1
+        print(f"Retrying {path}: attempt {retry_data[path]}/10")
+
+    Variable.set(RETRY_VAR_KEY, json.dumps(retry_data))
+
+with DAG(
+    dag_id='azure_file_retry_dag',
+    start_date=pendulum.now().subtract(days=1),
+    schedule_interval='@hourly',
+    catchup=False,
+    default_args=default_args,
+    tags=['azure', 'retry']
+) as dag:
+
+    def generate_retry_tasks(**context):
+        missing = context['ti'].xcom_pull(task_ids='fetch_missing_files') or []
+        for i, file_info in enumerate(missing):
+            PythonOperator(
+                task_id=f'retry_file_{i}',
+                python_callable=retry_file_check_with_limit,
+                op_kwargs={'file_info': file_info},
+                provide_context=True,
+                dag=dag
+            )
+
+    fetch_missing = PythonOperator(
+        task_id='fetch_missing_files',
+        python_callable=get_missing_files_from_xcom,
+        provide_context=True
     )
-    fs = AzureBlobFileSystem(account_name=creds["account_name"], credential=credential)
 
-    still_missing = []
-    updated_counts = {}
+    create_tasks = PythonOperator(
+        task_id='generate_retry_tasks',
+        python_callable=generate_retry_tasks,
+        provide_context=True
+    )
 
-    for check in failed_checks:
-        name = check["name"]
-        for label in ["file_path_lake", "file_path_daas"]:
-            path = check.get(label)
-            if not path:
-                continue
-            key = f"{name}::{label}::{path}"
-            retries = retry_counts.get(key, 0)
-
-            if retries >= MAX_RETRIES:
-                continue
-
-            full_path = f"{creds['container_name']}/{path}"
-            if not fs.exists(full_path):
-                still_missing.append({"name": name, "label": label, "path": path})
-                updated_counts[key] = retries + 1
-            else:
-                updated_counts[key] = 0  # reset on success
-
-    ti.xcom_push(key="retry_counts", value=updated_counts)
-    ti.xcom_push(key="still_missing", value=still_missing)
-
-    if still_missing:
-        raise Exception("Files still missing.")
+    fetch_missing >> create_tasks
