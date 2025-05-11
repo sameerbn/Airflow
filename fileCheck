@@ -1,177 +1,21 @@
-Perfect — you want the email subject to change dynamically depending on whether the file sensor succeeded or failed.
+from airflow.models import BaseOperator
+from airflow.utils.decorators import apply_defaults
+from adlfs import AzureBlobFileSystem
+from airflow.exceptions import AirflowException
 
-
----
-
-Updated Plan
-
-Instead of a static subject, we'll:
-
-Dynamically build subject and body together inside the prepare_email_body Python task.
-
-Pass both to the EmailOperator using XComs.
-
-
-
----
-
-Updated Code
-
-from airflow import DAG
-from airflow.operators.dummy import DummyOperator
-from airflow.operators.python import PythonOperator
-from airflow.sensors.base import BaseSensorOperator
-from airflow.models import Variable
-from airflow.operators.email import EmailOperator
-from airflow.utils.dates import days_ago
-from airflow.utils.task_group import TaskGroup
-from airflow.utils.trigger_rule import TriggerRule
-from datetime import timedelta, datetime
-import pendulum
-from croniter import croniter
-import json
-
-# Mock file check
-def files_exist_in_adls(paths):
-    return False  # Force fail for testing
-
-class AzureFileSensor(BaseSensorOperator):
-    def __init__(self, file_paths, *args, **kwargs):
+class CheckAzureFileOperator(BaseOperator):
+    @apply_defaults
+    def __init__(self, file_path, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        self.file_paths = file_paths
-
-    def poke(self, context):
-        return files_exist_in_adls(self.file_paths)
-
-default_args = {
-    'start_date': days_ago(1),
-}
-
-def should_run_today_func(config_schedule):
-    now = pendulum.now("UTC")
-    itr = croniter(config_schedule, now.subtract(minutes=1))
-    next_run = itr.get_next(datetime)
-    return now.date() == next_run.date()
-
-def prepare_email_content(**context):
-    ti = context['ti']
-    check_task_instance = ti.get_previous_ti()
+        self.file_path = file_path
     
-    task_status = "Success" if context['ti'].xcom_pull(task_ids='check_files_exist') else "Failure"
-    retries = 3  # Static, since we defined retries=3 for the sensor
-    config_name = context['config_name']
-    file_paths = context['file_paths']
-
-    if task_status == "Success":
-        subject = f"Airflow Success: Files found for {config_name}"
-    else:
-        subject = f"Airflow Failure: Files missing for {config_name}"
-
-    body = f"""
-    Hello Team,<br><br>
-    The file check task for <b>{config_name}</b> has completed.<br><br>
-    <b>Status:</b> {task_status}<br>
-    <b>Retries Attempted:</b> {retries}<br><br>
-    <b>Files Checked:</b> {file_paths}<br><br>
-    Regards,<br>
-    Airflow
-    """
-
-    # Push both subject and body
-    ti.xcom_push(key='email_subject', value=subject)
-    ti.xcom_push(key='email_body', value=body)
-
-with DAG(
-    dag_id="multi_config_file_checker_dynamic_subject",
-    default_args=default_args,
-    schedule_interval="0 * * * *",
-    catchup=False,
-) as dag:
-
-    start = DummyOperator(task_id="start")
-
-    config_json = Variable.get("file_checker_configs")
-    configs = json.loads(config_json)
-
-    for config in configs:
-        with TaskGroup(group_id=f"{config['name']}_tasks") as config_group:
-
-            should_run = PythonOperator(
-                task_id="should_run_today",
-                python_callable=lambda cs=config["schedule"]: should_run_today_func(cs),
-            )
-
-            check_files = AzureFileSensor(
-                task_id="check_files_exist",
-                file_paths=config["file_paths"],
-                poke_interval=1800,
-                mode='reschedule',
-                timeout=60*60*24,
-                retries=3,
-                retry_delay=timedelta(minutes=10),
-            )
-
-            prepare_email = PythonOperator(
-                task_id="prepare_email_content",
-                python_callable=prepare_email_content,
-                provide_context=True,
-                op_kwargs={
-                    "config_name": config["name"],
-                    "file_paths": config["file_paths"],
-                }
-            )
-
-            send_email = EmailOperator(
-                task_id="send_email",
-                to=config["notification_email"],
-                subject="{{ ti.xcom_pull(task_ids='prepare_email_content', key='email_subject') }}",
-                html_content="{{ ti.xcom_pull(task_ids='prepare_email_content', key='email_body') }}",
-                trigger_rule=TriggerRule.ALL_DONE,  # Always runs
-                retries=0,
-            )
-
-            should_run >> check_files >> prepare_email >> send_email
-
-        start >> config_group
-
-
----
-
-Now Email Will Look Like:
-
-If files are found:
-
-Subject: Airflow Success: Files found for config1
-
-Body: Shows status = Success
-
-
-If files are missing even after retries:
-
-Subject: Airflow Failure: Files missing for config1
-
-Body: Shows status = Failure
-
-
-
-
----
-
-Summary of Final Features
-
-File sensor retries 3 times.
-
-Email is always sent.
-
-Email subject and body are dynamic based on success/failure.
-
-Retries count is included in the email.
-
-
-
----
-
-Would you also want me to slightly improve it to attach a direct link to the Airflow task logs inside the email for easier debugging? (highly recommended for production setups!)
-Should I show you? (quick and useful!)
-
-
+    def execute(self, context):
+        abfs = AzureBlobFileSystem(account_name='your_account', account_key='your_key')
+        azure_path = self.file_path.replace("azure://", "")
+        
+        if abfs.exists(azure_path):
+            self.log.info(f"File {self.file_path} found in Azure Data Lake.")
+            return True
+        else:
+            self.log.error(f"File {self.file_path} not found in Azure Data Lake.")
+            raise AirflowException(f"File {self.file_path} not found!")
