@@ -1,0 +1,25 @@
+<dependencies>
+    <!-- Spark Core & SQL -->
+    <dependency>
+        <groupId>org.apache.spark</groupId>
+        <artifactId>spark-core_2.12</artifactId>
+        <version>3.4.1</version>
+    </dependency>
+    <dependency>
+        <groupId>org.apache.spark</groupId>
+        <artifactId>spark-sql_2.12</artifactId>
+        <version>3.4.1</version>
+    </dependency>
+
+    <!-- Azure ABFS Gen2 support -->
+    <dependency>
+        <groupId>org.apache.hadoop</groupId>
+        <artifactId>hadoop-azure</artifactId>
+        <version>3.3.4</version>
+    </dependency>
+    <dependency>
+        <groupId>org.apache.hadoop</groupId>
+        <artifactId>hadoop-azure-datalake</artifactId>
+        <version>3.3.4</version>
+    </dependency>
+</dependencies>
