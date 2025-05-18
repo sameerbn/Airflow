@@ -1,29 +1,25 @@
-WITH datamart_aligned AS (
+WITH all_trades AS (
     SELECT
         uniqueId,
         versiontimestamp,
         lakestoragetimestamp,
-        product.maturitydate,
-        product.effectiveMaturityDate,
+        product.maturitydate AS maturitydate,
+        product.effectiveMaturityDate AS effectivematuritydate,
         negotiatedcanceledindicator,
         destroyedindicator
-    FROM datamart_table
-),
-trade_otc_aligned AS (
-    SELECT
-        uniqueId,
-        versiontimestamp,
-        lakestoragetimestamp,
-        product.maturitydate,
-        product.effectiveMaturityDate,
-        negotiatedcanceledindicator,
-        destroyedindicator
-    FROM trade_otc_table
-),
-combined_data AS (
-    SELECT * FROM datamart_aligned
+    FROM olddatamart
+
     UNION ALL
-    SELECT * FROM trade_otc_aligned
+
+    SELECT
+        uniqueId,
+        versiontimestamp,
+        lakestoragetimestamp,
+        product.maturitydate AS maturitydate,
+        product.effectiveMaturityDate AS effectivematuritydate,
+        negotiatedcanceledindicator,
+        destroyedindicator
+    FROM trade_otc
 ),
 ranked_trades AS (
     SELECT *,
@@ -31,32 +27,16 @@ ranked_trades AS (
                PARTITION BY uniqueId
                ORDER BY versiontimestamp DESC, lakestoragetimestamp DESC
            ) AS rnk
-    FROM combined_data
-),
-latest_trades AS (
-    SELECT * FROM ranked_trades WHERE rnk = 1
-),
-live_deals AS (
-    SELECT *,
-        CASE
-            WHEN product.maturitydate IS NOT NULL AND 
-                 DATEDIFF(product.maturitydate, DATE '1970-01-01') >= DATEDIFF(DATE '{{runDate}}', DATE '1970-01-01')
-            THEN true ELSE false
-        END AS liveaspermaturitydate,
-
-        CASE
-            WHEN product.effectiveMaturityDate IS NOT NULL AND 
-                 DATEDIFF(product.effectiveMaturityDate, DATE '1970-01-01') >= DATEDIFF(DATE '{{runDate}}', DATE '1970-01-01')
-            THEN true ELSE false
-        END AS liveaspereffectivematuritydate
-    FROM latest_trades
-    WHERE (
-        (product.maturitydate IS NOT NULL AND DATEDIFF(product.maturitydate, DATE '1970-01-01') >= DATEDIFF(DATE '{{runDate}}', DATE '1970-01-01'))
-        OR
-        (product.effectiveMaturityDate IS NOT NULL AND DATEDIFF(product.effectiveMaturityDate, DATE '1970-01-01') >= DATEDIFF(DATE '{{runDate}}', DATE '1970-01-01'))
-    )
-    AND COALESCE(negotiatedcanceledindicator, false) = false
-    AND COALESCE(destroyedindicator, false) = false
+    FROM all_trades
 )
 
-SELECT * FROM live_deals;
+SELECT *
+FROM ranked_trades
+WHERE rnk = 1
+  AND (
+        maturitydate IS NULL
+        OR effectivematuritydate IS NULL
+        OR GREATEST(maturitydate, effectivematuritydate) >= DATE '{{runDate}}'
+  )
+  AND (negotiatedcanceledindicator IS NULL OR negotiatedcanceledindicator = FALSE)
+  AND (destroyedindicator IS NULL OR destroyedindicator = FALSE);
