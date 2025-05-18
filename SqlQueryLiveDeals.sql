@@ -1,37 +1,41 @@
-WITH all_trades AS (
-    SELECT
-        uniqueId,
-        versiontimestamp,
-        lakestoragetimestamp,
-        product.maturitydate AS maturitydate,
-        product.effectiveMaturityDate AS effectivematuritydate,
-        negotiatedcanceledindicator,
-        destroyedindicator
-    FROM olddatamart
-
-    UNION ALL
-
-    SELECT
-        uniqueId,
-        versiontimestamp,
-        lakestoragetimestamp,
-        product.maturitydate AS maturitydate,
-        product.effectiveMaturityDate AS effectivematuritydate,
-        negotiatedcanceledindicator,
-        destroyedindicator
-    FROM trade_otc
-),
-ranked_trades AS (
-    SELECT *,
-           ROW_NUMBER() OVER (
-               PARTITION BY uniqueId
-               ORDER BY versiontimestamp DESC, lakestoragetimestamp DESC
-           ) AS rnk
-    FROM all_trades
-)
-
 SELECT *
-FROM ranked_trades
+FROM (
+    SELECT
+        uniqueId,
+        versiontimestamp,
+        lakestoragetimestamp,
+        product.maturitydate AS maturitydate,
+        product.effectiveMaturityDate AS effectivematuritydate,
+        negotiatedcanceledindicator,
+        destroyedindicator,
+        ROW_NUMBER() OVER (
+            PARTITION BY uniqueId
+            ORDER BY versiontimestamp DESC, lakestoragetimestamp DESC
+        ) AS rnk
+    FROM (
+        SELECT
+            uniqueId,
+            versiontimestamp,
+            lakestoragetimestamp,
+            product.maturitydate,
+            product.effectiveMaturityDate,
+            negotiatedcanceledindicator,
+            destroyedindicator
+        FROM olddatamart
+
+        UNION ALL
+
+        SELECT
+            uniqueId,
+            versiontimestamp,
+            lakestoragetimestamp,
+            product.maturitydate,
+            product.effectiveMaturityDate,
+            negotiatedcanceledindicator,
+            destroyedindicator
+        FROM trade_otc
+    ) combined
+) ranked_trades
 WHERE rnk = 1
   AND (
         maturitydate IS NULL
