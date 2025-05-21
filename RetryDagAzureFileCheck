@@ -1,92 +1,63 @@
 from airflow import DAG
 from airflow.operators.python import PythonOperator
-from airflow.models import DagRun, TaskInstance, Variable
+from airflow.models import Variable
 from airflow.exceptions import AirflowSkipException
 from airflow.utils.email import send_email
-from datetime import timedelta
 from adlfs import AzureBlobFileSystem
 import pendulum
 import json
 
-RETRY_VAR_KEY = "azure_file_retry_tracker"
+RETRY_VAR_KEY = "retry_config_tracker"
 
-default_args = {
-    'retries': 0,
-}
-
-def get_missing_files_from_xcom(**context):
-    dag_runs = DagRun.find(dag_id='azure_file_check_dag')
-    if not dag_runs:
-        return []
-
-    latest_run = sorted(dag_runs, key=lambda r: r.execution_date, reverse=True)[0]
-    ti = TaskInstance(task=context['task'], execution_date=latest_run.execution_date)
-    ti.task_id = 'check_and_track_missing_files'
-    return ti.xcom_pull(
-        dag_id='azure_file_check_dag',
-        task_ids='check_and_track_missing_files',
-        key='missing_files'
-    ) or []
-
-def retry_file_check_with_limit(file_info, **context):
-    path = file_info['path']
+def retry_unresolved_configs():
     retry_data = Variable.get(RETRY_VAR_KEY, default_var='{}', deserialize_json=True)
-    retry_count = retry_data.get(path, 0)
-
-    if retry_count >= 10:
-        send_email(
-            to="alerts@yourcompany.com",
-            subject=f"[Airflow Alert] File missing after 10 retries: {path}",
-            html_content=f"""
-            <p>The file <strong>{path}</strong> has not been found in Azure Data Lake after 10 retry attempts.</p>
-            <p>This entry has now been removed from the retry tracker.</p>
-            """
-        )
-        retry_data.pop(path, None)
-        Variable.set(RETRY_VAR_KEY, json.dumps(retry_data))
-        raise AirflowSkipException(f"Max retries exceeded for {path}")
-
     abfs = AzureBlobFileSystem(account_name='your_account', account_key='your_key')
-    azure_path = path.replace("azure://", "")
-    if abfs.exists(azure_path):
-        print(f"File now available: {path}")
-        retry_data.pop(path, None)
-    else:
-        retry_data[path] = retry_count + 1
-        print(f"Retrying {path}: attempt {retry_data[path]}/10")
+    updated_data = {}
 
-    Variable.set(RETRY_VAR_KEY, json.dumps(retry_data))
+    for name, entry in retry_data.items():
+        retries = entry['retry']
+        config = entry['config']
+        paths = config['paths']
+
+        # Check file existence
+        missing = [p for p in paths if not abfs.exists(p.replace("azure://", ""))]
+
+        if not missing:
+            print(f"Config {name} resolved. Removing from retry tracker.")
+            continue  # Drop from retry tracker if resolved
+
+        if retries >= 20:
+            print(f"Max retries reached for {name}. Dropping from retry tracker.")
+            # Optional: send alert
+            send_email(
+                to="alerts@yourcompany.com",
+                subject=f"[Airflow Alert] Retry limit reached for config: {name}",
+                html_content=f"""
+                <p>Config <strong>{name}</strong> has failed for 20 consecutive retries.</p>
+                <p>It has now been removed from the retry tracker.</p>
+                <pre>{json.dumps(config, indent=2)}</pre>
+                """
+            )
+            continue  # Drop from tracker
+
+        # If still missing and retry < 20, update count
+        updated_data[name] = {
+            "retry": retries + 1,
+            "config": config
+        }
+        print(f"Retrying {name}: attempt {retries + 1}/20")
+
+    # Save updated tracker
+    Variable.set(RETRY_VAR_KEY, json.dumps(updated_data))
 
 with DAG(
-    dag_id='azure_file_retry_dag',
+    dag_id='azure_config_retry_dag',
     start_date=pendulum.now().subtract(days=1),
     schedule_interval='@hourly',
-    catchup=False,
-    default_args=default_args,
-    tags=['azure', 'retry']
+    catchup=False
 ) as dag:
 
-    def generate_retry_tasks(**context):
-        missing = context['ti'].xcom_pull(task_ids='fetch_missing_files') or []
-        for i, file_info in enumerate(missing):
-            PythonOperator(
-                task_id=f'retry_file_{i}',
-                python_callable=retry_file_check_with_limit,
-                op_kwargs={'file_info': file_info},
-                provide_context=True,
-                dag=dag
-            )
-
-    fetch_missing = PythonOperator(
-        task_id='fetch_missing_files',
-        python_callable=get_missing_files_from_xcom,
-        provide_context=True
+    retry_check = PythonOperator(
+        task_id='retry_unresolved_configs',
+        python_callable=retry_unresolved_configs
     )
-
-    create_tasks = PythonOperator(
-        task_id='generate_retry_tasks',
-        python_callable=generate_retry_tasks,
-        provide_context=True
-    )
-
-    fetch_missing >> create_tasks
