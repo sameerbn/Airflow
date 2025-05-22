@@ -1,12 +1,13 @@
 from airflow import DAG
 from airflow.operators.python import PythonOperator
-from airflow.models import Variable
+from airflow.models import Variable, XCom
+from airflow.utils.session import provide_session
 from datetime import datetime, timedelta
 from azure.storage.filedatalake import DataLakeServiceClient
 import json
 import logging
 
-# Replace with your actual Azure Data Lake connection string
+# Constants
 AZURE_CONNECTION_STRING = "YOUR_CONNECTION_STRING"
 RETRY_TRACKER_VAR = "retry_config_tracker"
 SOURCE_DAG_ID = "dag_a_id"
@@ -26,35 +27,40 @@ def check_file_exists(service_client, file_path):
         file_client = file_system.get_file_client("/".join(path_parts))
         file_client.get_file_properties()
         return True
-    except Exception as e:
-        logging.info(f"File not found or error checking {file_path}: {e}")
+    except Exception:
+        logging.info(f"File not found or error checking {file_path}")
         return False
 
-def process_failed_configs(**context):
-    ti = context['ti']
-
-    # Pull failed configs from other DAG
-    failed_configs = ti.xcom_pull(
+@provide_session
+def get_latest_failed_configs(session=None):
+    # Query for most recent XCom with key 'failed_configs' from the source task
+    latest_xcom = session.query(XCom).filter_by(
         dag_id=SOURCE_DAG_ID,
-        task_ids=SOURCE_TASK_ID,
+        task_id=SOURCE_TASK_ID,
         key='failed_configs'
-    ) or []
+    ).order_by(XCom.execution_date.desc()).first()
 
-    # Load current tracker
+    return latest_xcom.value if latest_xcom else []
+
+def process_failed_configs(**context):
+    # Step 1: Pull latest failed configs via XCom
+    failed_configs = get_latest_failed_configs()
+
+    # Step 2: Load current retry tracker
     tracker_json = Variable.get(RETRY_TRACKER_VAR, default_var='[]')
     retry_tracker = json.loads(tracker_json)
 
-    # Avoid duplicates (name, rundate)
+    # Step 3: Merge new configs (no duplicates on name + rundate)
     existing_keys = {(cfg['name'], cfg['rundate']) for cfg in retry_tracker}
     for cfg in failed_configs:
         key = (cfg['name'], cfg['rundate'])
         if key not in existing_keys:
             retry_tracker.append(cfg)
 
-    # Init Azure Data Lake client
+    # Step 4: Init Azure client
     service_client = DataLakeServiceClient.from_connection_string(AZURE_CONNECTION_STRING)
 
-    # Process tracker
+    # Step 5: Process merged tracker
     updated_tracker = []
     for cfg in retry_tracker:
         name = cfg['name']
@@ -65,20 +71,20 @@ def process_failed_configs(**context):
         file2_exists = check_file_exists(service_client, cfg['file_path_2'])
 
         if file1_exists and file2_exists:
-            logging.info(f"Files found for {name} ({rundate}) — removing from retry tracker.")
+            logging.info(f"{name} ({rundate}) resolved — removing.")
             continue
 
         retry_count += 1
         if retry_count > MAX_RETRIES:
-            logging.warning(f"Exceeded max retries for {name} ({rundate}) — removing.")
+            logging.warning(f"{name} ({rundate}) exceeded retries — removing.")
             continue
 
         cfg['retry_count'] = retry_count
         updated_tracker.append(cfg)
 
-    # Save final tracker
+    # Step 6: Save updated tracker
     Variable.set(RETRY_TRACKER_VAR, json.dumps(updated_tracker))
-    logging.info(f"Updated retry_config_tracker with {len(updated_tracker)} entries.")
+    logging.info(f"Tracker updated with {len(updated_tracker)} entries.")
 
 # Define the DAG
 with DAG(
