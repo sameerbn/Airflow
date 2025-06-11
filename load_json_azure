@@ -1,0 +1,85 @@
+To load a JSON file from Azure Data Lake Gen2 (ABFS) in Airflow, use adlfs or fsspec together with azure-identity and azure-storage-file-datalake. Here's a working setup.
+
+
+---
+
+✅ Prerequisites
+
+1. Install dependencies (in your Airflow environment):
+
+pip install adlfs azure-identity
+
+
+2. Have a Service Principal or Managed Identity with access to the storage account.
+
+
+
+
+---
+
+✅ Airflow Example using adlfs + PythonOperator
+
+from airflow import DAG
+from airflow.operators.python import PythonOperator
+from datetime import datetime
+import json
+import adlfs
+from azure.identity import ClientSecretCredential
+
+def load_json_from_abfs(**kwargs):
+    # Azure credentials
+    tenant_id = "<your-tenant-id>"
+    client_id = "<your-client-id>"
+    client_secret = "<your-client-secret>"
+    account_name = "<your-storage-account-name>"
+
+    # File path
+    file_path = "my-container/path/to/your-file.json"
+
+    # Authenticate and connect
+    credential = ClientSecretCredential(tenant_id, client_id, client_secret)
+    fs = adlfs.AzureBlobFileSystem(account_name=account_name, credential=credential)
+
+    with fs.open(file_path, 'r') as f:
+        json_data = json.load(f)
+        kwargs['ti'].xcom_push(key='json_data', value=json_data)
+
+default_args = {
+    'start_date': datetime(2023, 1, 1),
+    'catchup': False
+}
+
+with DAG('load_json_from_abfs',
+         schedule_interval=None,
+         default_args=default_args,
+         tags=['azure', 'abfs']) as dag:
+
+    task = PythonOperator(
+        task_id='load_json',
+        python_callable=load_json_from_abfs,
+        provide_context=True
+    )
+
+
+---
+
+🔐 Secure Credential Handling
+
+Instead of hardcoding, store credentials in Airflow Variables or Connections, or use a Managed Identity in Azure-hosted Airflow.
+
+
+---
+
+🔁 ABFS URI format
+
+If you're curious:
+
+abfs://<container>@<storage-account>.dfs.core.windows.net/<path>
+
+But adlfs handles it internally using the container + path style.
+
+
+---
+
+Want me to help adapt this to use Airflow connections or your current retry-based DAG setup?
+
