@@ -1,0 +1,39 @@
+import org.apache.spark.sql.SparkSession
+import org.apache.spark.sql.types._
+
+val spark = SparkSession.builder()
+  .appName("AvroToParquetLocal")
+  .master("local[*]")
+  .getOrCreate()
+
+val avroSchema = StructType(Seq(
+  StructField("TRIGRAM", StringType, true),
+  StructField("DEALID", StringType, true),
+  StructField("VERSIONID", StringType, true),
+  StructField("REGULATIONNAME", StringType, true),
+  StructField("ELIGIBILITYMSG", StringType, true),
+  StructField("AUDITTIMESTAMP", StringType, true),
+  StructField("ELIGIBLEFLAG", StringType, true),
+  StructField("GCPP", StringType, true),
+  StructField("REPORTINGCDEFLAG", StringType, true),
+  StructField("EEFLAG", StringType, true),
+  StructField("AGENCYLENDING", StringType, true),
+  StructField("CREATIONDATE", StringType, true),
+  StructField("FCAELIGIBLE", StringType, true),
+  StructField("FCAELIGIBLECP", StringType, true),
+  StructField("FCAGCP", StringType, true),
+  StructField("FCAREPORTINGELIGIBLE", StringType, true),
+  StructField("FCAREPORTINGELIGIBLECP", StringType, true),
+  StructField("FCACEB", StringType, true)
+))
+
+val avroDF = spark.read
+  .format("avro")
+  .schema(avroSchema)
+  .load("file:///your/local/path/input.avro")
+
+avroDF.write
+  .mode("overwrite")
+  .parquet("file:///your/local/path/output_parquet")
+
+spark.stop()
