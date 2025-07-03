@@ -1,0 +1,34 @@
+import json
+from airflow import DAG
+from airflow.providers.http.operators.http import SimpleHttpOperator
+from airflow.utils.dates import days_ago
+
+dag = DAG("livy_spn_submit", start_date=days_ago(1), schedule_interval=None)
+
+livy_payload = {
+    "file": "abfss://<container>@<storage>.dfs.core.windows.net/path/to/your.jar",
+    "className": "com.your.MainClass",
+    "args": [],
+    "conf": {
+        "spark.hadoop.fs.azure.account.auth.type.<storage>.dfs.core.windows.net": "OAuth",
+        "spark.hadoop.fs.azure.account.oauth.provider.type.<storage>.dfs.core.windows.net": "org.apache.hadoop.fs.azurebfs.oauth2.ClientCredsTokenProvider",
+        "spark.hadoop.fs.azure.account.oauth2.client.id.<storage>.dfs.core.windows.net": "<client-id>",
+        "spark.hadoop.fs.azure.account.oauth2.client.secret.<storage>.dfs.core.windows.net": "<client-secret>",
+        "spark.hadoop.fs.azure.account.oauth2.client.endpoint.<storage>.dfs.core.windows.net": "https://login.microsoftonline.com/<tenant-id>/oauth2/token"
+    },
+    "name": "spark-job-spn",
+    "executorMemory": "4g",
+    "driverMemory": "4g",
+    "executorCores": 2
+}
+
+submit_livy_job = SimpleHttpOperator(
+    task_id="submit_livy_job",
+    http_conn_id="livy_connection",  # Define this in Airflow Connections
+    endpoint="batches",
+    method="POST",
+    headers={"Content-Type": "application/json"},
+    data=json.dumps(livy_payload),
+    response_check=lambda response: response.status_code == 201,
+    dag=dag,
+)
