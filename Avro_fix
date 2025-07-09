@@ -1,46 +1,96 @@
-import org.apache.spark.sql.Dataset;
-import org.apache.spark.sql.Row;
-import org.apache.spark.sql.SparkSession;
-import org.apache.spark.sql.types.*;
+import io
+from azure.identity import ClientSecretCredential
+from azure.storage.filedatalake import DataLakeServiceClient
+import pyarrow.parquet as pq
+from fastavro import reader as avro_reader
 
-public class AvroToParquetConverter {
-    public static void main(String[] args) {
+def get_adls_file_client(account_name, container_name, file_path, tenant_id, client_id, client_secret):
+    credential = ClientSecretCredential(
+        tenant_id=tenant_id,
+        client_id=client_id,
+        client_secret=client_secret
+    )
 
-        SparkSession spark = SparkSession.builder()
-                .appName("AvroToParquet")
-                .master("local[*]")
-                .getOrCreate();
+    service_client = DataLakeServiceClient(
+        account_url=f"https://{account_name}.dfs.core.windows.net",
+        credential=credential
+    )
 
-        StructType schema = new StructType(new StructField[]{
-                new StructField("TRIGRAM", DataTypes.StringType, true, Metadata.empty()),
-                new StructField("DEALID", DataTypes.StringType, true, Metadata.empty()),
-                new StructField("VERSIONID", DataTypes.StringType, true, Metadata.empty()),
-                new StructField("REGULATIONNAME", DataTypes.StringType, true, Metadata.empty()),
-                new StructField("ELIGIBILITYMSG", DataTypes.StringType, true, Metadata.empty()),
-                new StructField("AUDITTIMESTAMP", DataTypes.StringType, true, Metadata.empty()),
-                new StructField("ELIGIBLEFLAG", DataTypes.StringType, true, Metadata.empty()),
-                new StructField("GCPP", DataTypes.StringType, true, Metadata.empty()),
-                new StructField("REPORTINGCDEFLAG", DataTypes.StringType, true, Metadata.empty()),
-                new StructField("EEFLAG", DataTypes.StringType, true, Metadata.empty()),
-                new StructField("AGENCYLENDING", DataTypes.StringType, true, Metadata.empty()),
-                new StructField("CREATIONDATE", DataTypes.StringType, true, Metadata.empty()),
-                new StructField("FCAELIGIBLE", DataTypes.StringType, true, Metadata.empty()),
-                new StructField("FCAELIGIBLECP", DataTypes.StringType, true, Metadata.empty()),
-                new StructField("FCAGCP", DataTypes.StringType, true, Metadata.empty()),
-                new StructField("FCAREPORTINGELIGIBLE", DataTypes.StringType, true, Metadata.empty()),
-                new StructField("FCAREPORTINGELIGIBLECP", DataTypes.StringType, true, Metadata.empty()),
-                new StructField("FCACEB", DataTypes.StringType, true, Metadata.empty())
-        });
+    file_system_client = service_client.get_file_system_client(container_name)
+    file_client = file_system_client.get_file_client(file_path)
+    return file_client
 
-        Dataset<Row> avroDF = spark.read()
-                .format("avro")
-                .schema(schema)
-                .load("file:///path/to/input.avro");
 
-        avroDF.write()
-                .mode("overwrite")
-                .parquet("file:///path/to/output_parquet");
+def has_record_in_parquet(file_client) -> bool:
+    try:
+        props = file_client.get_file_properties()
+        file_size = props.size
 
-        spark.stop();
-    }
-}
+        if file_size < 16:
+            return False  # Definitely not valid
+
+        footer_len = min(file_size, 64 * 1024)
+        footer_data = file_client.download_file(
+            offset=file_size - footer_len,
+            length=footer_len
+        ).readall()
+
+        # Pad front to simulate full file size
+        full_data = b"\x00" * (file_size - footer_len) + footer_data
+
+        with io.BytesIO(full_data) as f:
+            parquet_file = pq.ParquetFile(f)
+            return parquet_file.metadata.num_rows > 0
+
+    except Exception as e:
+        print(f"Parquet read failed: {e}")
+        return False
+
+
+def has_record_in_avro(file_client) -> bool:
+    try:
+        # Read first 256KB only
+        file_data = file_client.download_file(offset=0, length=256 * 1024).readall()
+        with io.BytesIO(file_data) as f:
+            avro_r = avro_reader(f)
+            for _ in avro_r:
+                return True
+        return False
+    except Exception as e:
+        print(f"Avro read failed: {e}")
+        return False
+
+
+def check_file_records(account_name, container_name, file_path, tenant_id, client_id, client_secret):
+    file_client = get_adls_file_client(
+        account_name, container_name, file_path, tenant_id, client_id, client_secret
+    )
+
+    if file_path.endswith(".parquet"):
+        return has_record_in_parquet(file_client)
+    elif file_path.endswith(".avro"):
+        return has_record_in_avro(file_client)
+    else:
+        print(f"Unsupported file type: {file_path}")
+        return False
+
+
+# Airflow PythonOperator-compatible wrapper
+def airflow_check_task(**context):
+    # Example inputs from Variables/XComs/config
+    account_name = "youraccount"
+    container_name = "yourcontainer"
+    file_path = "path/to/file.parquet"
+    tenant_id = "your-tenant-id"
+    client_id = "your-client-id"
+    client_secret = "your-client-secret"
+
+    has_data = check_file_records(
+        account_name, container_name, file_path,
+        tenant_id, client_id, client_secret
+    )
+
+    if has_data:
+        print(f"✅ File has data: {file_path}")
+    else:
+        print(f"🚫 File is empty or unreadable: {file_path}")
