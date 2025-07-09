@@ -1,96 +1,48 @@
 import io
-from azure.identity import ClientSecretCredential
-from azure.storage.filedatalake import DataLakeServiceClient
-import pyarrow.parquet as pq
+from azure.storage.filedatalake import DataLakeFileClient
+from pyarrow.parquet import ParquetFile
 from fastavro import reader as avro_reader
 
-def get_adls_file_client(account_name, container_name, file_path, tenant_id, client_id, client_secret):
-    credential = ClientSecretCredential(
-        tenant_id=tenant_id,
-        client_id=client_id,
-        client_secret=client_secret
-    )
-
-    service_client = DataLakeServiceClient(
-        account_url=f"https://{account_name}.dfs.core.windows.net",
-        credential=credential
-    )
-
-    file_system_client = service_client.get_file_system_client(container_name)
-    file_client = file_system_client.get_file_client(file_path)
-    return file_client
-
-
-def has_record_in_parquet(file_client) -> bool:
+def has_records_adls_file(file_client: DataLakeFileClient, max_bytes=1 * 1024 * 1024) -> bool:
     try:
         props = file_client.get_file_properties()
         file_size = props.size
 
-        if file_size < 16:
-            return False  # Definitely not valid
+        if file_size == 0:
+            print(f"⚠️ File is empty: {file_client.path_name}")
+            return False
 
-        footer_len = min(file_size, 64 * 1024)
-        footer_data = file_client.download_file(
-            offset=file_size - footer_len,
-            length=footer_len
-        ).readall()
+        # Read first 1MB of the file
+        read_size = min(file_size, max_bytes)
+        file_data = file_client.download_file(offset=0, length=read_size).readall()
 
-        # Pad front to simulate full file size
-        full_data = b"\x00" * (file_size - footer_len) + footer_data
+        # Check Avro
+        if file_client.path_name.endswith(".avro"):
+            try:
+                with io.BytesIO(file_data) as f:
+                    avro_r = avro_reader(f)
+                    for _ in avro_r:
+                        return True
+                return False
+            except Exception as e:
+                print(f"❌ Avro read failed: {e}")
+                return False
 
-        with io.BytesIO(full_data) as f:
-            parquet_file = pq.ParquetFile(f)
-            return parquet_file.metadata.num_rows > 0
+        # Check Parquet
+        elif file_client.path_name.endswith(".parquet"):
+            try:
+                with io.BytesIO(file_data) as f:
+                    pf = ParquetFile(f)
+                    table = pf.read_row_groups([0], max_rows=1)
+                    return table.num_rows > 0
+            except Exception as e:
+                print(f"❌ Parquet read failed: {e}")
+                return False
+
+        else:
+            print(f"⚠️ Unsupported file extension: {file_client.path_name}")
+            return False
 
     except Exception as e:
-        print(f"Parquet read failed: {e}")
+        print(f"❌ Error processing {file_client.path_name}: {e}")
         return False
-
-
-def has_record_in_avro(file_client) -> bool:
-    try:
-        # Read first 256KB only
-        file_data = file_client.download_file(offset=0, length=256 * 1024).readall()
-        with io.BytesIO(file_data) as f:
-            avro_r = avro_reader(f)
-            for _ in avro_r:
-                return True
-        return False
-    except Exception as e:
-        print(f"Avro read failed: {e}")
-        return False
-
-
-def check_file_records(account_name, container_name, file_path, tenant_id, client_id, client_secret):
-    file_client = get_adls_file_client(
-        account_name, container_name, file_path, tenant_id, client_id, client_secret
-    )
-
-    if file_path.endswith(".parquet"):
-        return has_record_in_parquet(file_client)
-    elif file_path.endswith(".avro"):
-        return has_record_in_avro(file_client)
-    else:
-        print(f"Unsupported file type: {file_path}")
-        return False
-
-
-# Airflow PythonOperator-compatible wrapper
-def airflow_check_task(**context):
-    # Example inputs from Variables/XComs/config
-    account_name = "youraccount"
-    container_name = "yourcontainer"
-    file_path = "path/to/file.parquet"
-    tenant_id = "your-tenant-id"
-    client_id = "your-client-id"
-    client_secret = "your-client-secret"
-
-    has_data = check_file_records(
-        account_name, container_name, file_path,
-        tenant_id, client_id, client_secret
-    )
-
-    if has_data:
-        print(f"✅ File has data: {file_path}")
-    else:
-        print(f"🚫 File is empty or unreadable: {file_path}")
