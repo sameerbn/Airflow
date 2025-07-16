@@ -1,48 +1,27 @@
-import io
-from azure.storage.filedatalake import DataLakeFileClient
-from pyarrow.parquet import ParquetFile
-from fastavro import reader as avro_reader
+from datetime import datetime, timedelta
 
-def has_records_adls_file(file_client: DataLakeFileClient, max_bytes=1 * 1024 * 1024) -> bool:
-    try:
-        props = file_client.get_file_properties()
-        file_size = props.size
+def get_weekday_offset_date(start_date, offset_days):
+    step = 1 if offset_days > 0 else -1
+    current = start_date
+    days_moved = 0
 
-        if file_size == 0:
-            print(f"⚠️ File is empty: {file_client.path_name}")
-            return False
+    while days_moved != abs(offset_days):
+        current += timedelta(days=step)
+        if current.weekday() < 5:  # Monday=0, ..., Friday=4
+            days_moved += 1
 
-        # Read first 1MB of the file
-        read_size = min(file_size, max_bytes)
-        file_data = file_client.download_file(offset=0, length=read_size).readall()
+    return current
 
-        # Check Avro
-        if file_client.path_name.endswith(".avro"):
-            try:
-                with io.BytesIO(file_data) as f:
-                    avro_r = avro_reader(f)
-                    for _ in avro_r:
-                        return True
-                return False
-            except Exception as e:
-                print(f"❌ Avro read failed: {e}")
-                return False
+def resolve_dynamic_dates(path):
+    today = datetime.utcnow()
 
-        # Check Parquet
-        elif file_client.path_name.endswith(".parquet"):
-            try:
-                with io.BytesIO(file_data) as f:
-                    pf = ParquetFile(f)
-                    table = pf.read_row_groups([0], max_rows=1)
-                    return table.num_rows > 0
-            except Exception as e:
-                print(f"❌ Parquet read failed: {e}")
-                return False
+    replacements = {
+        "${D}": today.strftime('%Y-%m-%d'),
+        "{D-1}": get_weekday_offset_date(today, -1).strftime('%Y-%m-%d'),
+        "{D-2}": get_weekday_offset_date(today, -2).strftime('%Y-%m-%d'),
+        "{D+1}": get_weekday_offset_date(today, 1).strftime('%Y-%m-%d')
+    }
 
-        else:
-            print(f"⚠️ Unsupported file extension: {file_client.path_name}")
-            return False
-
-    except Exception as e:
-        print(f"❌ Error processing {file_client.path_name}: {e}")
-        return False
+    for key, val in replacements.items():
+        path = path.replace(key, val)
+    return path
