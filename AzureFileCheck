@@ -1,48 +1,21 @@
-from azure.identity import ClientSecretCredential
-from azure.storage.filedatalake import DataLakeServiceClient
-from azure.core.exceptions import HttpResponseError
-
-# Replace these with your technical account's values
-TENANT_ID = "<your-tenant-id>"
-CLIENT_ID = "<your-client-id>"
-CLIENT_SECRET = "<your-client-secret>"
-STORAGE_ACCOUNT_NAME = "<your-storage-account-name>"
-FILE_SYSTEM_NAME = "<your-filesystem-name>"  # aka container name
-PATH = "<your-path-in-filesystem>"  # e.g., "folder1/file.txt" or "folder1/"
-
-def check_datalake_read_access():
+def directory_exists_and_has_data(file_path, file_system_client):
     try:
-        # Authenticate using the technical account
-        credential = ClientSecretCredential(
-            tenant_id=TENANT_ID,
-            client_id=CLIENT_ID,
-            client_secret=CLIENT_SECRET
-        )
+        directory_client = file_system_client.get_directory_client(file_path)
 
-        # Connect to Data Lake service
-        service_client = DataLakeServiceClient(
-            account_url=f"https://{STORAGE_ACCOUNT_NAME}.dfs.core.windows.net",
-            credential=credential
-        )
+        # First check: does the directory exist?
+        directory_client.get_directory_properties()
+        
+        # If it exists, check for data files inside it
+        paths = list(file_system_client.get_paths(path=file_path, recursive=False))
+        for file in paths:
+            if not file.is_directory and (
+                file.name.endswith(".avro") or file.name.endswith(".parquet")
+            ):
+                if file.content_length and file.content_length > 0:
+                    return "SUCCESS"
 
-        # Get file system client
-        file_system_client = service_client.get_file_system_client(FILE_SYSTEM_NAME)
+        return "ZERO_RECORD_FILE"  # Directory exists, but no usable data found
 
-        # Try to list the directory or read the file
-        path_client = file_system_client.get_directory_client(PATH)
-        paths = list(path_client.get_paths())
-
-        print(f"SUCCESS: Able to read from path '{PATH}'. Items found:")
-        for p in paths:
-            print(f"  - {p.name}")
-        return True
-
-    except HttpResponseError as e:
-        print(f"ERROR: Unable to read path '{PATH}'. HTTP {e.status_code} - {e.message}")
-        return False
     except Exception as e:
-        print(f"EXCEPTION: {str(e)}")
-        return False
-
-if __name__ == "__main__":
-    check_datalake_read_access()
+        print(f"[ERROR] Directory check failed for: {file_path} | Exception: {e}")
+        return "FAILED"  # Directory doesn't exist or not accessible
