@@ -1,27 +1,33 @@
-from datetime import datetime, timedelta
+@provide_session
+def get_all_failed_configs(session=None):
+    """Fetch all failed XComs from two DAGs, append them back with 'read_' prefix, delete originals, and return values."""
 
-def get_weekday_offset_date(start_date, offset_days):
-    step = 1 if offset_days > 0 else -1
-    current = start_date
-    days_moved = 0
+    xcoms_1 = session.query(XCom).filter(
+        XCom.dag_id == 'punctuality-boy-suv-main-dag',
+        XCom.task_id == 'check_and_trigger',
+        XCom.key == 'failed_checks'
+    ).order_by(XCom.timestamp.desc()).all()
 
-    while days_moved != abs(offset_days):
-        current += timedelta(days=step)
-        if current.weekday() < 5:  # Monday=0, ..., Friday=4
-            days_moved += 1
+    xcoms_2 = session.query(XCom).filter(
+        XCom.dag_id == 'completeness-girl-car-main-dag',
+        XCom.task_id == 'check_and_trigger',
+        XCom.key == 'failed_completeness'
+    ).order_by(XCom.timestamp.desc()).all()
 
-    return current
+    result = []
 
-def resolve_dynamic_dates(path):
-    today = datetime.utcnow()
+    for xcom in xcoms_1 + xcoms_2:
+        # Push value with new key before deletion
+        XCom.set(
+            key=f"read_{xcom.key}",
+            value=xcom.value,
+            dag_id=xcom.dag_id,
+            task_id=xcom.task_id,
+            run_id=xcom.run_id,
+            session=session
+        )
+        result.append(xcom.value)
+        session.delete(xcom)
 
-    replacements = {
-        "${D}": today.strftime('%Y-%m-%d'),
-        "{D-1}": get_weekday_offset_date(today, -1).strftime('%Y-%m-%d'),
-        "{D-2}": get_weekday_offset_date(today, -2).strftime('%Y-%m-%d'),
-        "{D+1}": get_weekday_offset_date(today, 1).strftime('%Y-%m-%d')
-    }
-
-    for key, val in replacements.items():
-        path = path.replace(key, val)
-    return path
+    session.commit()
+    return result
