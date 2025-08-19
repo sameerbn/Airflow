@@ -19,3 +19,33 @@ def directory_exists_and_has_data(file_path, file_system_client):
     except Exception as e:
         print(f"[ERROR] Directory check failed for: {file_path} | Exception: {e}")
         return "FAILED"  # Directory doesn't exist or not accessible
+
+import os
+from avro.datafile import DataFileReader
+from avro.io import DatumReader
+import pyarrow.parquet as pq
+
+def has_records(file_path: str) -> bool:
+    ext = os.path.splitext(file_path)[1].lower()
+
+    if ext == ".avro":
+        with open(file_path, "rb") as f:
+            reader = DataFileReader(f, DatumReader())
+            try:
+                next(reader)   # just check first record
+                reader.close()
+                return True
+            except StopIteration:
+                reader.close()
+                return False
+
+    elif ext == ".parquet":
+        metadata = pq.ParquetFile(file_path).metadata
+        return metadata.num_rows > 0
+
+    else:
+        raise ValueError(f"Unsupported file type: {ext}")
+
+# Example usage
+print(has_records("data.avro"))
+print(has_records("data.parquet"))
