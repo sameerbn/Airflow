@@ -1,51 +1,74 @@
-def directory_exists_and_has_data(file_path, file_system_client):
-    try:
-        directory_client = file_system_client.get_directory_client(file_path)
-
-        # First check: does the directory exist?
-        directory_client.get_directory_properties()
-        
-        # If it exists, check for data files inside it
-        paths = list(file_system_client.get_paths(path=file_path, recursive=False))
-        for file in paths:
-            if not file.is_directory and (
-                file.name.endswith(".avro") or file.name.endswith(".parquet")
-            ):
-                if file.content_length and file.content_length > 0:
-                    return "SUCCESS"
-
-        return "ZERO_RECORD_FILE"  # Directory exists, but no usable data found
-
-    except Exception as e:
-        print(f"[ERROR] Directory check failed for: {file_path} | Exception: {e}")
-        return "FAILED"  # Directory doesn't exist or not accessible
-
 import os
+from io import BytesIO
 from avro.datafile import DataFileReader
 from avro.io import DatumReader
 import pyarrow.parquet as pq
 
-def has_records(file_path: str) -> bool:
-    ext = os.path.splitext(file_path)[1].lower()
-
-    if ext == ".avro":
-        with open(file_path, "rb") as f:
-            reader = DataFileReader(f, DatumReader())
+def avro_has_records_stream(file_client) -> bool:
+    """
+    Efficiently check if Avro file has at least one record
+    by reading only until the first record (not entire file).
+    """
+    stream = file_client.download_file().chunks()
+    bio = BytesIO()
+    
+    # Read progressively until we can decide
+    for chunk in stream:
+        bio.write(chunk)
+        bio.seek(0)
+        try:
+            reader = DataFileReader(bio, DatumReader())
             try:
-                next(reader)   # just check first record
+                next(reader)   # try first record
                 reader.close()
                 return True
             except StopIteration:
                 reader.close()
                 return False
+        except Exception:
+            # not enough bytes yet, keep downloading
+            continue
+    
+    return False
 
-    elif ext == ".parquet":
-        metadata = pq.ParquetFile(file_path).metadata
-        return metadata.num_rows > 0
 
-    else:
-        raise ValueError(f"Unsupported file type: {ext}")
+def parquet_has_records_stream(file_client) -> bool:
+    """
+    Efficiently check if Parquet file has at least one row.
+    PyArrow reads metadata footer only.
+    """
+    data = file_client.download_file().readall()
+    bio = BytesIO(data)
+    parquet_file = pq.ParquetFile(bio)
+    return parquet_file.metadata.num_rows > 0
 
-# Example usage
-print(has_records("data.avro"))
-print(has_records("data.parquet"))
+
+def directory_exists_and_has_data(file_path, file_system_client):
+    try:
+        directory_client = file_system_client.get_directory_client(file_path)
+
+        # Ensure directory exists
+        directory_client.get_directory_properties()
+
+        # List all files recursively
+        paths = list(file_system_client.get_paths(path=file_path, recursive=True))
+
+        if not paths:
+            return "EMPTY_DIRECTORY"
+
+        for file in paths:
+            if not file.is_directory and (file.name.endswith(".avro") or file.name.endswith(".parquet")):
+                if file.content_length > 0:
+                    file_client = file_system_client.get_file_client(file.name)
+
+                    if file.name.endswith(".avro") and avro_has_records_stream(file_client):
+                        return "FILE_FOUND"
+
+                    if file.name.endswith(".parquet") and parquet_has_records_stream(file_client):
+                        return "FILE_FOUND"
+
+        return "ZERO_RECORD_FILE"
+
+    except Exception as e:
+        print(f"[ERROR] Directory check failed for: {file_path} | Exception: {e}")
+        return "PARTITION_NOT_FOUND"
