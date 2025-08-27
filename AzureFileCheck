@@ -1,74 +1,44 @@
-import os
-from io import BytesIO
-from avro.datafile import DataFileReader
-from avro.io import DatumReader
-import pyarrow.parquet as pq
+import time
 
-def avro_has_records_stream(file_client) -> bool:
+MAX_SIZE_BYTES = 50 * 1024 * 1024  # 50 MB
+
+def directory_exists_and_has_data(file_path, file_system_client, retries=3, wait=10, timeout=60):
     """
-    Efficiently check if Avro file has at least one record
-    by reading only until the first record (not entire file).
+    Check if directory exists and contains valid Avro/Parquet data files.
+    Retries on transient failures.
     """
-    stream = file_client.download_file().chunks()
-    bio = BytesIO()
-    
-    # Read progressively until we can decide
-    for chunk in stream:
-        bio.write(chunk)
-        bio.seek(0)
+    for attempt in range(1, retries + 1):
         try:
-            reader = DataFileReader(bio, DatumReader())
-            try:
-                next(reader)   # try first record
-                reader.close()
-                return True
-            except StopIteration:
-                reader.close()
-                return False
-        except Exception:
-            # not enough bytes yet, keep downloading
-            continue
-    
-    return False
+            # Ensure directory exists
+            directory_client = file_system_client.get_directory_client(file_path)
+            directory_client.get_directory_properties(timeout=timeout)
 
+            # List all files recursively
+            paths = list(file_system_client.get_paths(path=file_path, recursive=True, timeout=timeout))
+            if not paths:
+                return "EMPTY_DIRECTORY"
 
-def parquet_has_records_stream(file_client) -> bool:
-    """
-    Efficiently check if Parquet file has at least one row.
-    PyArrow reads metadata footer only.
-    """
-    data = file_client.download_file().readall()
-    bio = BytesIO(data)
-    parquet_file = pq.ParquetFile(bio)
-    return parquet_file.metadata.num_rows > 0
+            for file in paths:
+                if not file.is_directory and (file.name.endswith(".avro") or file.name.endswith(".parquet")):
+                    if file.content_length > 0:
+                        # Skip record check if file size is > 50 MB
+                        if file.content_length > MAX_SIZE_BYTES:
+                            return "FILE_FOUND"
 
+                        file_client = file_system_client.get_file_client(file.name)
 
-def directory_exists_and_has_data(file_path, file_system_client):
-    try:
-        directory_client = file_system_client.get_directory_client(file_path)
+                        if file.name.endswith(".avro") and avro_has_records_stream(file_client):
+                            return "FILE_FOUND"
 
-        # Ensure directory exists
-        directory_client.get_directory_properties()
+                        if file.name.endswith(".parquet") and parquet_has_records_stream(file_client):
+                            return "FILE_FOUND"
 
-        # List all files recursively
-        paths = list(file_system_client.get_paths(path=file_path, recursive=True))
+            return "ZERO_RECORD_FILE"
 
-        if not paths:
-            return "EMPTY_DIRECTORY"
-
-        for file in paths:
-            if not file.is_directory and (file.name.endswith(".avro") or file.name.endswith(".parquet")):
-                if file.content_length > 0:
-                    file_client = file_system_client.get_file_client(file.name)
-
-                    if file.name.endswith(".avro") and avro_has_records_stream(file_client):
-                        return "FILE_FOUND"
-
-                    if file.name.endswith(".parquet") and parquet_has_records_stream(file_client):
-                        return "FILE_FOUND"
-
-        return "ZERO_RECORD_FILE"
-
-    except Exception as e:
-        print(f"[ERROR] Directory check failed for: {file_path} | Exception: {e}")
-        return "PARTITION_NOT_FOUND"
+        except Exception as e:
+            print(f"[WARN] Attempt {attempt}/{retries} failed for {file_path} | {e}")
+            if attempt < retries:
+                time.sleep(wait)
+            else:
+                print(f"[ERROR] Directory check failed after {retries} attempts: {file_path}")
+                return "PARTITION_NOT_FOUND"
