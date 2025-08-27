@@ -1,11 +1,13 @@
 import time
+from azure.core.exceptions import ResourceNotFoundError, HttpResponseError
 
 MAX_SIZE_BYTES = 50 * 1024 * 1024  # 50 MB
 
 def directory_exists_and_has_data(file_path, file_system_client, retries=3, wait=10, timeout=60):
     """
     Check if directory exists and contains valid Avro/Parquet data files.
-    Retries on transient failures.
+    Retries only on transient errors (timeouts, network issues).
+    Skips retry if the directory/blob truly doesn't exist.
     """
     for attempt in range(1, retries + 1):
         try:
@@ -21,7 +23,7 @@ def directory_exists_and_has_data(file_path, file_system_client, retries=3, wait
             for file in paths:
                 if not file.is_directory and (file.name.endswith(".avro") or file.name.endswith(".parquet")):
                     if file.content_length > 0:
-                        # Skip record check if file size is > 50 MB
+                        # Skip record check if file size > 50 MB
                         if file.content_length > MAX_SIZE_BYTES:
                             return "FILE_FOUND"
 
@@ -35,7 +37,26 @@ def directory_exists_and_has_data(file_path, file_system_client, retries=3, wait
 
             return "ZERO_RECORD_FILE"
 
+        except ResourceNotFoundError as e:
+            # Hard fail: directory/blob does not exist
+            print(f"[ERROR] Path not found: {file_path} | {e}")
+            return "PARTITION_NOT_FOUND"
+
+        except HttpResponseError as e:
+            # Skip retry if it's a 404 error
+            if "The specified blob does not exist" in str(e):
+                print(f"[ERROR] Blob not found: {file_path} | {e}")
+                return "PARTITION_NOT_FOUND"
+            else:
+                print(f"[WARN] Attempt {attempt}/{retries} failed for {file_path} | {e}")
+                if attempt < retries:
+                    time.sleep(wait)
+                else:
+                    print(f"[ERROR] Directory check failed after {retries} attempts: {file_path}")
+                    return "PARTITION_NOT_FOUND"
+
         except Exception as e:
+            # Generic transient error (retryable)
             print(f"[WARN] Attempt {attempt}/{retries} failed for {file_path} | {e}")
             if attempt < retries:
                 time.sleep(wait)
