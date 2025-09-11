@@ -1,0 +1,32 @@
+%spark
+import org.apache.spark.sql.DataFrame
+
+// List of ADLS paths you want to check
+val paths = Seq(
+  "abfss://container@account.dfs.core.windows.net/path/to/parquet1",
+  "abfss://container@account.dfs.core.windows.net/path/to/parquet2",
+  "abfss://container@account.dfs.core.windows.net/path/to/parquet3"
+)
+
+// Function to safely count records (supports parquet, avro, csv)
+def getCount(path: String): (String, Long) = {
+  try {
+    val df: DataFrame = 
+      if (path.endsWith(".avro")) {
+        spark.read.format("avro").load(path)
+      } else if (path.endsWith(".csv")) {
+        spark.read.option("header", "true").csv(path)
+      } else {
+        spark.read.parquet(path)
+      }
+    (path, df.count())
+  } catch {
+    case e: Exception => (path, -1) // -1 = error
+  }
+}
+
+// Collect results
+val results = paths.map(getCount).toDF("Path", "RecordCount")
+
+// Show as Zeppelin table
+z.show(results)
