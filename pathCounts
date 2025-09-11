@@ -1,6 +1,6 @@
 %livy2.pyspark
-from pyspark.sql.types import *
 from datetime import datetime, timedelta
+import numpy as np
 
 base_path = "abfss://lake@...../your_table"  # change this to your base path
 
@@ -8,32 +8,45 @@ base_path = "abfss://lake@...../your_table"  # change this to your base path
 start_date_str = "20250815"   # 👈 change this
 start_date = datetime.strptime(start_date_str, "%Y%m%d")
 
-# Get weekday of start_date (0=Monday, 6=Sunday)
-target_weekday = start_date.weekday()
+# How many past same-weekdays you want
+N = 6   # e.g., last 6 Fridays if start_date is a Friday
 
-# Generate past 30 days (relative to start_date) in yyyyMMdd format
-dates = [
-    (start_date - timedelta(days=i)).strftime("%Y%m%d")
-    for i in range(30)
-    if (start_date - timedelta(days=i)).weekday() == target_weekday
-]
+# Generate last N same-weekdays (including start_date)
+dates = [(start_date - timedelta(weeks=i)).strftime("%Y%m%d") for i in range(N)]
 
-results = []
+counts = []
 for d in dates:
     path = f"{base_path}/dt={d}"   # adjust "dt=" if your partition key is different
     try:
         df = spark.read.parquet(path)
-        cnt = df.count()
-        results.append((d, cnt))
+        counts.append(df.count())
     except Exception:
-        # skip missing partitions silently
+        # skip missing partitions
         pass
 
-# Create DataFrame for Zeppelin display
-schema = StructType([
-    StructField("date", StringType(), True),
-    StructField("record_count", LongType(), True)
-])
-df_out = spark.createDataFrame(results, schema)
+# Show counts in reverse date order (latest → oldest)
+print("Historical counts (latest first):")
+for c in counts:
+    print(c)
 
-z.show(df_out.orderBy("date"))
+# --- Prediction excluding outliers ---
+if counts:
+    arr = np.array(counts)
+
+    # Compute IQR for outlier detection
+    Q1 = np.percentile(arr, 25)
+    Q3 = np.percentile(arr, 75)
+    IQR = Q3 - Q1
+    lower_bound = Q1 - 1.5 * IQR
+    upper_bound = Q3 + 1.5 * IQR
+
+    # Filter outliers
+    filtered = arr[(arr >= lower_bound) & (arr <= upper_bound)]
+
+    if len(filtered) > 0:
+        prediction = int(filtered.mean())
+        print("\nPredicted next count (excluding outliers):", prediction)
+    else:
+        print("\nPrediction not possible (all values treated as outliers).")
+else:
+    print("No counts found.")
