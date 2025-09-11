@@ -1,32 +1,29 @@
-%spark
-import org.apache.spark.sql.DataFrame
+%livy2.pyspark
+from pyspark.sql import SparkSession
+from pyspark.sql.types import *
+from datetime import datetime, timedelta
 
-// List of ADLS paths you want to check
-val paths = Seq(
-  "abfss://container@account.dfs.core.windows.net/path/to/parquet1",
-  "abfss://container@account.dfs.core.windows.net/path/to/parquet2",
-  "abfss://container@account.dfs.core.windows.net/path/to/parquet3"
-)
+base_path = "abfss://lake@...../your_table"  # change this to your table base path
 
-// Function to safely count records (supports parquet, avro, csv)
-def getCount(path: String): (String, Long) = {
-  try {
-    val df: DataFrame = 
-      if (path.endsWith(".avro")) {
-        spark.read.format("avro").load(path)
-      } else if (path.endsWith(".csv")) {
-        spark.read.option("header", "true").csv(path)
-      } else {
-        spark.read.parquet(path)
-      }
-    (path, df.count())
-  } catch {
-    case e: Exception => (path, -1) // -1 = error
-  }
-}
+# Generate past 30 days (yyyy-MM-dd format, adjust to your partition style)
+dates = [(datetime.today() - timedelta(days=i)).strftime("%Y-%m-%d") for i in range(30)]
 
-// Collect results
-val results = paths.map(getCount).toDF("Path", "RecordCount")
+results = []
+for d in dates:
+    path = f"{base_path}/dt={d}"   # adjust partition key (dt=, date=, storageday=, etc.)
+    try:
+        df = spark.read.parquet(path)
+        cnt = df.count()
+        results.append((d, cnt))
+    except Exception:
+        # skip missing partitions silently
+        pass
 
-// Show as Zeppelin table
-z.show(results)
+# Create dataframe for display
+schema = StructType([
+    StructField("date", StringType(), True),
+    StructField("record_count", LongType(), True)
+])
+df_out = spark.createDataFrame(results, schema)
+
+df_out.orderBy("date").show(30, False)
