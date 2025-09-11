@@ -1,16 +1,26 @@
 %livy2.pyspark
-from pyspark.sql import SparkSession
 from pyspark.sql.types import *
 from datetime import datetime, timedelta
 
-base_path = "abfss://lake@...../your_table"  # change this to your table base path
+base_path = "abfss://lake@...../your_table"  # change this to your base path
 
-# Generate past 30 days (yyyy-MM-dd format, adjust to your partition style)
-dates = [(datetime.today() - timedelta(days=i)).strftime("%Y-%m-%d") for i in range(30)]
+# Define your custom start date here (yyyyMMdd format)
+start_date_str = "20250815"   # 👈 change this
+start_date = datetime.strptime(start_date_str, "%Y%m%d")
+
+# Get weekday of start_date (0=Monday, 6=Sunday)
+target_weekday = start_date.weekday()
+
+# Generate past 30 days (relative to start_date) in yyyyMMdd format
+dates = [
+    (start_date - timedelta(days=i)).strftime("%Y%m%d")
+    for i in range(30)
+    if (start_date - timedelta(days=i)).weekday() == target_weekday
+]
 
 results = []
 for d in dates:
-    path = f"{base_path}/dt={d}"   # adjust partition key (dt=, date=, storageday=, etc.)
+    path = f"{base_path}/dt={d}"   # adjust "dt=" if your partition key is different
     try:
         df = spark.read.parquet(path)
         cnt = df.count()
@@ -19,11 +29,11 @@ for d in dates:
         # skip missing partitions silently
         pass
 
-# Create dataframe for display
+# Create DataFrame for Zeppelin display
 schema = StructType([
     StructField("date", StringType(), True),
     StructField("record_count", LongType(), True)
 ])
 df_out = spark.createDataFrame(results, schema)
 
-df_out.orderBy("date").show(30, False)
+z.show(df_out.orderBy("date"))
