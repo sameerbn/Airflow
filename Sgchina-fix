@@ -44,13 +44,16 @@ public Dataset<Row> enrichWithGalaxyOpal(SparkSession spark, Dataset<Row> listed
     joinedDF.show(false);
 
     // 5. Build Dictionary Maps per deal (Key: "ID|Scheme", Value: Enriched Data)
-    Dataset<Row> mapsDf = joinedDF
-        .groupBy(TRADE_DEAL_REFERENCE)
-        .agg(
-            expr("map_from_arrays(collect_list(lookup_key), collect_list(shortname))").alias("map_shortname"),
-            expr("map_from_arrays(collect_list(lookup_key), collect_list(mnemonic))").alias("map_mnemonic"),
-            expr("map_from_arrays(collect_list(lookup_key), collect_list(isin))").alias("map_isin")
-        );
+    // 5. Build Dictionary Maps per deal using map_from_entries to safely handle NULL values
+Dataset<Row> mapsDf = joinedDF
+    .groupBy(TRADE_DEAL_REFERENCE)
+    .agg(
+        // Pack key and value into a struct BEFORE collecting. 
+        // A struct with a null value is not entirely null, so collect_list won't drop it.
+        expr("map_from_entries(collect_list(struct(lookup_key, shortname)))").alias("map_shortname"),
+        expr("map_from_entries(collect_list(struct(lookup_key, mnemonic)))").alias("map_mnemonic"),
+        expr("map_from_entries(collect_list(struct(lookup_key, isin)))").alias("map_isin")
+    );
 
     // 6. Join maps back to the ORIGINAL dataframe and translate the arrays in-place
     // The 'size' field and all other original columns remain perfectly intact here
