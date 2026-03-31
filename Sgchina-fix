@@ -1,0 +1,70 @@
+public Dataset<Row> enrichWithGalaxyOpal(SparkSession spark, Dataset<Row> listedInstrumentIdNotNullDf) {
+
+    // 1. Convert comma-separated strings to arrays and create a composite lookup key (ID|Scheme)
+    // Example: id="ID1,ID2", scheme="SCH1,SCH2" -> lookup_keys=["ID1|SCH1", "ID2|SCH2"]
+    Dataset<Row> arraysDf = listedInstrumentIdNotNullDf
+        .withColumn("id_arr", expr("split(trim(" + LISTED_INSTRUMENT_ID + "), ',')"))
+        .withColumn("scheme_arr", expr("split(trim(" + LISTED_INSTRUMENT_ID_SCHEME + "), ',')"))
+        .withColumn("lookup_keys", expr("transform(arrays_zip(id_arr, scheme_arr), x -> concat_ws('|', trim(x.id_arr), trim(x.scheme_arr)))"));
+
+    log.info("arraysDf with lookup_keys");
+    arraysDf.show(false);
+
+    // 2. Explode unique keys per deal to prepare for the Galaxy API call
+    // dropDuplicates ensures we don't query Galaxy twice for the same instrument in a single trade
+    Dataset<Row> explodedForJoin = arraysDf
+        .select(col(TRADE_DEAL_REFERENCE), expr("explode(lookup_keys)").alias("lookup_key"))
+        .dropDuplicates(TRADE_DEAL_REFERENCE, "lookup_key")
+        .withColumn(LISTED_INSTRUMENT_ID, expr("split(lookup_key, '\\\\|')[0]"))
+        .withColumn(LISTED_INSTRUMENT_ID_SCHEME, expr("split(lookup_key, '\\\\|')[1]"));
+
+    log.info("explodedForJoin");
+    explodedForJoin.show(false);
+
+    // 3. Fetch Galaxy Data using the deduplicated keys
+    Dataset<Row> galaxyDs = getGalaxyDfWithRetry(explodedForJoin, spark);
+
+    log.info("galaxyDataset");
+    galaxyDs.show(false);
+
+    // 4. Join exploded keys with Galaxy data
+    Column leftIdScheme = explodedForJoin.col(LISTED_INSTRUMENT_ID_SCHEME);
+    Column leftId = explodedForJoin.col(LISTED_INSTRUMENT_ID);
+    Column rightIdScheme = galaxyDs.col("galaxy_" + LISTED_INSTRUMENT_ID_SCHEME);
+    Column rightId = galaxyDs.col("galaxy_" + LISTED_INSTRUMENT_ID);
+    Column galaxyJoinExpr = leftIdScheme.equalTo(rightIdScheme).and(leftId.equalTo(rightId));
+
+    log.info("-- Joining on DaaS columns: {} and {} --", leftIdScheme, leftId);
+    log.info("-- Joining on Galaxy columns: {} and {} --", rightIdScheme, rightId);
+
+    // Broadcast the Galaxy reference data for a faster join
+    Dataset<Row> joinedDF = explodedForJoin.join(broadcast(galaxyDs), galaxyJoinExpr, "left");
+
+    log.info("joinedDF");
+    joinedDF.show(false);
+
+    // 5. Build Dictionary Maps per deal (Key: "ID|Scheme", Value: Enriched Data)
+    Dataset<Row> mapsDf = joinedDF
+        .groupBy(TRADE_DEAL_REFERENCE)
+        .agg(
+            expr("map_from_arrays(collect_list(lookup_key), collect_list(shortname))").alias("map_shortname"),
+            expr("map_from_arrays(collect_list(lookup_key), collect_list(mnemonic))").alias("map_mnemonic"),
+            expr("map_from_arrays(collect_list(lookup_key), collect_list(isin))").alias("map_isin")
+        );
+
+    // 6. Join maps back to the ORIGINAL dataframe and translate the arrays in-place
+    // The 'size' field and all other original columns remain perfectly intact here
+    Dataset<Row> finalDs = arraysDf
+        .join(mapsDf, TRADE_DEAL_REFERENCE, "left")
+        // Look up each original key in the map, then join the results with commas
+        .withColumn(GALAXY_SHORTNAME, expr("array_join(transform(lookup_keys, k -> map_shortname[k]), ',')"))
+        .withColumn(GALAXY_MNEMONIC, expr("array_join(transform(lookup_keys, k -> map_mnemonic[k]), ',')"))
+        .withColumn(GALAXY_ISIN, expr("array_join(transform(lookup_keys, k -> map_isin[k]), ',')"))
+        // Clean up all temporary columns used for the transformation
+        .drop("id_arr", "scheme_arr", "lookup_keys", "map_shortname", "map_mnemonic", "map_isin");
+
+    log.info("finalDs");
+    finalDs.show(false);
+
+    return finalDs;
+}
