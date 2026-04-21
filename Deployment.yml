@@ -1,0 +1,29 @@
+spec:
+  template:
+    spec:
+      initContainers:
+      - name: cert-import
+        image: openjdk:11-jre-slim # Use an image that has 'keytool'
+        command: ["sh", "-c"]
+        args:
+          - |
+            cp $JAVA_HOME/lib/security/cacerts /custom-truststore/cacerts;
+            keytool -importcert -trustcacerts -file /certs/sg-internal-ca.crt -alias sg-internal-ca -keystore /custom-truststore/cacerts -storepass changeit -noprompt;
+        volumeMounts:
+        - name: cert-volume
+          mountPath: /certs
+        - name: truststore-volume
+          mountPath: /custom-truststore
+      containers:
+      - name: dqt-punctuality-service
+        # ... your existing config
+        volumeMounts:
+        - name: truststore-volume
+          mountPath: /opt/java/openjdk/lib/security/cacerts # Adjust to your $JAVA_HOME
+          subPath: cacerts
+      volumes:
+      - name: cert-volume
+        configMap:
+          name: sg-ca-cert
+      - name: truststore-volume
+        emptyDir: {}
